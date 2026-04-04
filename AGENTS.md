@@ -108,3 +108,79 @@ To conserve context space, load these resources as needed:
 - [Jinja engine](common/jinja/README.md)
 - [How to add a new model](docs/development/HOWTO-add-model.md)
 - [PR template](.github/pull_request_template.md)
+
+---
+
+## Jetson TX2 / CUDA 10.2 Build Context
+
+**Status: BUILD SUCCEEDED.** `llama-cli` and `llama-server` compile and run on Jetson TX2 (aarch64, sm_62, CUDA 10.2, GCC 8.5.0).
+
+### Host environment (fixed)
+- Platform: Jetson TX2, aarch64, Linux
+- CUDA: 10.2 (`CUDART_VERSION = 10020`), nvcc at `/usr/local/cuda/bin/nvcc`
+- GCC 8.5.0 at `/usr/local/bin/gcc` and `/usr/local/bin/g++` (must be forced via cmake — native `/usr/bin/cc` is GCC 7.5 which is too old)
+- CMake 3.28.3
+- GPU: NVIDIA Tegra X2, compute capability 6.2, 7858 MiB VRAM
+
+### CMake configuration (already run — do NOT re-run unless CMakeLists.txt changed)
+```bash
+cmake -B build -S . \
+  -DCMAKE_C_COMPILER=/usr/local/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/local/bin/g++ \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=62 \
+  -DCMAKE_CUDA_STANDARD=14 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF
+```
+
+### Build command
+```bash
+cmake --build build --target llama-cli llama-server -j$(nproc)
+```
+
+### Run the server
+```bash
+./build/bin/llama-server \
+  --model models/llama-2-7b.Q4_0.gguf \
+  --n-gpu-layers 99 \
+  --chat-template llama2 \
+  --ctx-size 4096
+```
+
+### CUDA 10.2 compatibility facts (verified by testing)
+- nvcc 10.2 with `--std=c++14` warns on `if constexpr` but does **not** prune dead branches — all branches are compiled regardless
+- **Fold expressions** `(expr || ...)` are rejected — replaced with array-expansion trick
+- **Structured bindings** `for (auto & [a, b] : c)` are rejected — replaced with `.first`/`.second`
+- **`if` with init-statement** `if (auto x = f(); cond)` is rejected — split into two statements
+- **`static inline const`** non-integral non-constexpr data members are rejected — use `static constexpr` for enums, inline the value for float/half
+- **`std::is_same_v<>`** does not exist — shimmed via `namespace std` injection in `vendors/cuda.h`
+- **`nv_bfloat162`** does not exist (only `nv_bfloat16` as a typedef for `half`) — stub struct added in `vendors/cuda.h`
+- **`nv_bfloat162`, `__float2bfloat16`, `__bfloat162float`, `__bfloat1622float2`** do not exist — guarded with `#if CUDART_VERSION >= 11000`
+- **`CUDA_R_16BF`** (cublas enum) does not exist — guarded with `#if CUDART_VERSION >= 11000`
+- **`__builtin_assume`** not available in nvcc device code — shimmed with `#define __builtin_assume(x) ((void)0)` in `fattn-common.cuh`
+- **`cooperative_groups/reduce.h`** does not exist — the sub-header was added in CUDA 11; guarded with `#if CUDART_VERSION >= 11000`
+- **`cudaStreamWaitEvent`** requires explicit `flags` (third arg = `0`) — later CUDA made it default but CUDA 10.2 does not
+- **`std::filesystem`** requires explicit `-lstdc++fs` linkage with GCC < 9 — added to `ggml/src/CMakeLists.txt` and `common/CMakeLists.txt`
+- `CMAKE_CUDA_STANDARD=14` is required to prevent CMake from passing `--std=c++17` to nvcc
+
+### Patches applied (all local, no upstream PR)
+
+| File | What was changed |
+|------|-----------------|
+| `ggml/src/ggml-cuda/vendors/cuda.h` | Added `std::is_same_v` shim for `__cplusplus < 201703L`; added stub `nv_bfloat162` struct for `CUDART_VERSION < 11000` |
+| `ggml/src/ggml-cuda/common.cuh` | Replaced C++17 fold-expression `is_any` with C++14 recursive helper; replaced 4 structured bindings in `stream_mapping`/`cuda_graphs` loops |
+| `ggml/src/ggml-cuda/softmax.cu` | Replaced fold expression; guarded `#include <cooperative_groups/reduce.h>`, `soft_max_f32_parallelize_cols_single_row`, `soft_max_f32_parallelize_cols`, and cooperative launch site with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/binbcast.cu` | Replaced 2 comma fold expressions with initializer-list expansion trick |
+| `ggml/src/ggml-cuda/convert.cuh` | Guarded all `nv_bfloat162`/`__float2bfloat16`/`__bfloat162float`/`__bfloat1622float2` uses with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/fattn-common.cuh` | Added `__builtin_assume` shim; guarded `vec_dot_fattn_vec_KQ_bf16`, `dequantize_V_bf16`, and their dispatch references with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/mma.cuh` | Guarded 4 `nv_bfloat162` specializations/overloads with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/mmf.cuh` | Added `CUDA11_DECL(x)` macro; used it to guard `nv_bfloat162` entries in `DECL_MMF_CASE_EXTERN` and `DECL_MMF_CASE` macros |
+| `ggml/src/ggml-cuda/mmf.cu` | Guarded `GGML_TYPE_BF16` case (uses `nv_bfloat162`) with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | Guarded BF16 batched GEMM block (line ~1307); replaced `static inline const` with `static constexpr` in `batched_mul_mat_traits`, guarded BF16 specialization and its switch case; split C++17 if-with-init at line ~2155; added `0` flags arg to 2 `cudaStreamWaitEvent` calls; replaced 4 structured bindings |
+| `ggml/src/ggml-cuda/fattn.cu` | Guarded all `FATTN_VEC_CASES_ALL_D` calls involving `GGML_TYPE_BF16` with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*bf16*.cu` (×13) | Guarded all `DECL_FATTN_VEC_CASE` calls with `#if CUDART_VERSION >= 11000` |
+| `ggml/src/CMakeLists.txt` | Added `-lstdc++fs` for GCC < 9 on `ggml` target |
+| `common/CMakeLists.txt` | Added `-lstdc++fs` for GCC < 9 on `common` target |
