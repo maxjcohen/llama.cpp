@@ -6,6 +6,13 @@
 
 #include <cstdint>
 
+// CUDA 10.2 does not support __builtin_assume in device code.
+#if CUDART_VERSION < 11000 && !defined(__CUDA_ARCH__)
+#  define __builtin_assume(x) ((void)0)
+#elif CUDART_VERSION < 11000
+#  define __builtin_assume(x) ((void)0)
+#endif
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -74,6 +81,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     return sum;
 }
 
+#if CUDART_VERSION >= 11000
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -104,6 +112,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
 
     return sum;
 }
+#endif // CUDART_VERSION >= 11000
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
@@ -352,6 +361,7 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
     }
 }
 
+#if CUDART_VERSION >= 11000
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     static_assert(std::is_same_v<T, float>, "BF16 V dequantization only supports float output");
@@ -364,6 +374,7 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
         dst_f2[l] = ggml_cuda_cast<float2>(tmp[l]);
     }
 }
+#endif // CUDART_VERSION >= 11000
 
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
@@ -591,8 +602,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+#if CUDART_VERSION >= 11000
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+#endif // CUDART_VERSION >= 11000
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -613,8 +626,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+#if CUDART_VERSION >= 11000
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+#endif // CUDART_VERSION >= 11000
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

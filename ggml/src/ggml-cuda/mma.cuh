@@ -410,6 +410,7 @@ namespace ggml_cuda_mma {
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
     };
 
+#if CUDART_VERSION >= 11000
     template <int I_, int J_>
     struct tile<I_, J_, nv_bfloat162, DATA_LAYOUT_I_MAJOR> {
         static constexpr int         I  = I_;
@@ -484,6 +485,7 @@ namespace ggml_cuda_mma {
         }
 #endif  // defined(AMD_WMMA_AVAILABLE)
     };
+#endif // CUDART_VERSION >= 11000
 
     template <int I_, int J_, typename T>
     struct tile<I_, J_, T, DATA_LAYOUT_J_MAJOR> {
@@ -595,6 +597,7 @@ namespace ggml_cuda_mma {
 #endif // defined(RDNA3)
     };
 
+#if CUDART_VERSION >= 11000
     template <int I_, int J_>
     struct tile<I_, J_, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED> {
         static constexpr int         I  = I_;
@@ -616,6 +619,7 @@ namespace ggml_cuda_mma {
             return tile<I_, J_, float, DATA_LAYOUT_I_MAJOR_MIRRORED>::get_j(l);
         }
     };
+#endif // CUDART_VERSION >= 11000
 
     template <int I_, int J_>
     struct tile<I_, J_, half2, DATA_LAYOUT_J_MAJOR_MIRRORED> {
@@ -1087,6 +1091,7 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+#if CUDART_VERSION >= 11000
     static __device__ __forceinline__ void mma(
             tile<16, 8, float> & D, const tile<16, 8, nv_bfloat162> & A, const tile<8, 8, nv_bfloat162> & B) {
 #ifdef AMPERE_MMA_AVAILABLE
@@ -1101,6 +1106,7 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
     }
+#endif // CUDART_VERSION >= 11000
 
     template <data_layout dl_ab, data_layout dl_d>
     static __device__ __forceinline__ void mma(
@@ -1163,6 +1169,7 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+#if CUDART_VERSION >= 11000
     template <data_layout dl_ab, data_layout dl_d>
     static __device__ __forceinline__ void mma(
             tile<16, 16, float, dl_d> & D, const tile<16, 8, nv_bfloat162, dl_ab> & A, const tile<16, 8, nv_bfloat162, dl_ab> & B) {
@@ -1210,6 +1217,7 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
 #endif // defined(AMD_WMMA_AVAILABLE)
     }
+#endif // CUDART_VERSION >= 11000
 
     template <data_layout dl_d, data_layout dl_ab>
     static __device__ __forceinline__ void mma(

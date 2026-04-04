@@ -545,8 +545,19 @@ enum class block_reduce_method {
 template<block_reduce_method method_t, typename T>
 struct block_reduce_policy;
 
+// C++14-compatible replacement for the C++17 fold-expression version.
+// nvcc 10.2 supports --std=c++14 only; fold expressions are not available.
+namespace ggml_cuda_detail {
+    template<typename T>
+    static constexpr bool is_any_of() { return false; }
+    template<typename T, typename First, typename... Rest>
+    static constexpr bool is_any_of() {
+        return std::is_same<T, First>::value || is_any_of<T, Rest...>();
+    }
+} // namespace ggml_cuda_detail
+
 template <typename T, typename... Ts>
-inline constexpr bool is_any = (std::is_same_v<T, Ts> || ...);
+constexpr bool is_any = ggml_cuda_detail::is_any_of<T, Ts...>();
 
 template<typename...>
 inline constexpr bool ggml_cuda_dependent_false_v = false;
@@ -1253,7 +1264,9 @@ struct ggml_cuda_concurrent_event {
         const int64_t       join_start = (int64_t) join_t->data;
         const int64_t       join_end   = join_start + ggml_nbytes(join_t);
 
-        for (const auto & [tensor, stream] : stream_mapping) {
+        for (const auto & sm_entry : stream_mapping) {
+            const ggml_tensor * tensor = sm_entry.first;
+            int stream = sm_entry.second;
             const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
@@ -1274,7 +1287,9 @@ struct ggml_cuda_concurrent_event {
 
         bool writes_overlap = false;
         bool dependent_srcs = false;
-        for (const auto & [tensor, stream] : stream_mapping) {
+        for (const auto & sm_entry2 : stream_mapping) {
+            const ggml_tensor * tensor = sm_entry2.first;
+            int stream = sm_entry2.second;
             const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
@@ -1380,7 +1395,8 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
-        for (const auto & [key, graph] : cuda_graphs) {
+        for (const auto & cg_entry : cuda_graphs) {
+            const auto & graph = cg_entry.second;
             if (graph && graph->is_enabled()) {
                 return true;
             }
@@ -1390,7 +1406,8 @@ struct ggml_backend_cuda_context {
 
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
-        for (const auto & [key, graph] : cuda_graphs) {
+        for (const auto & cg_entry2 : cuda_graphs) {
+            const auto & graph = cg_entry2.second;
             if (graph && graph->instance != nullptr) {
                 return true;
             }
