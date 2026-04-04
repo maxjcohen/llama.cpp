@@ -106,11 +106,11 @@ MK_NVCCFLAGS = -std=c++11
 ifdef LLAMA_FAST
 MK_CFLAGS     += -Ofast
 HOST_CXXFLAGS += -Ofast
-MK_NVCCFLAGS  += -O3
+MK_NVCCFLAGS += -maxrregcount=80
 else
 MK_CFLAGS     += -O3
 MK_CXXFLAGS   += -O3
-MK_NVCCFLAGS  += -O3
+MK_NVCCFLAGS += -maxrregcount=80
 endif
 
 ifndef LLAMA_NO_CCACHE
