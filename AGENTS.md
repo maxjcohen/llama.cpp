@@ -138,7 +138,7 @@ cmake -B build -S . \
 
 ### Build command
 ```bash
-cmake --build build --target llama-cli llama-server -j$(nproc)
+cmake --build build --target llama-cli llama-server llama-bench -j$(nproc)
 ```
 
 ### Run the server
