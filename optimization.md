@@ -91,3 +91,68 @@ Device 0: NVIDIA Tegra X2, compute capability 6.2, VMM: no, VRAM: 7858 MiB
 **Delta vs Step 3**: pp512 +0.5%, tg128 flat
 **Delta vs Step 0**: pp512 +1.0%, tg128 +18.1%
 
+## Analysis of remaining opportunities (no further gains found)
+
+After Step 4, all remaining kernel-level optimization candidates were analyzed and ruled out. The hardware ceiling for the 2-SM Tegra X2 has been reached for Q4_0 inference.
+
+### MMQ kernel (pp512 bottleneck)
+
+Shared memory per MMQ block for Q4_0 (`mmq_y=64, mmq_x=64`):
+- `nbs_x` (X tile: qs + dm) = 9504 bytes
+- `nbs_y` (Y tile: 64 × block_q8_1_mmq) = 9216 bytes
+- `nbs_ids` = 256 bytes
+- **Total ≈ 18.5 KB** → `floor(48 KB / 18.5 KB) = 2 blocks/SM` — hard hardware constraint
+
+Approaches tried or computed:
+- `mmq_x=24`: shmem drops to 13 KB → 3 blocks/SM, but `ceil(256/24)=11` tiles vs current 4 → tile overhead overwhelms the occupancy gain (same failure mode as `mmq_y=32` which measured −21% on pp512)
+- `mmq_x=96`: shmem ≈ 23.7 KB → still 2 blocks/SM, no improvement
+- `mmq_x=128`: shmem ≈ 28.4 KB → 1 block/SM, worse
+
+Increasing `mmq_x_max` for Pascal beyond 64 makes things worse; the current value is already optimal.
+
+### MMVQ kernel (tg128 bottleneck)
+
+Already at peak occupancy after Step 3. With `nwarps=2` (64 threads/block):
+- Threads limit: `2048 / 64 = 32 blocks/SM` — exactly the Pascal block limit
+- Both the thread limit and block limit are saturated simultaneously; no further gain possible
+
+Trying `nwarps=1` (32 threads/block): `2048 / 32 = 64` → still capped at 32 blocks/SM by the block limit. No additional blocks can be scheduled; the only effect is halving the arithmetic per block.
+
+### RMS norm
+
+Already addressed in Step 4. `rms_norm_back_f32_cuda` (training backward pass) was not changed — not executed during inference.
+
+### SiLU activation (FFN gate)
+
+Already uses 256 threads/block (`CUDA_GLU_BLOCK_SIZE=256`). For FFN hidden_size=9216: 36 blocks total, well above the 16-block SM capacity. No change needed.
+
+### RoPE
+
+Uses `block_dims=(1, 256, 1)` — 256 threads per block. With head_dim=256: exactly 1 block per row, all threads active. Already optimal.
+
+### Softmax
+
+The `soft_max_f32_cuda` dispatcher uses templated specializations where `block_size_template == ncols_template`. Reducing `nth` for few-SM GPUs would cause the `p.ncols == ncols` template check to fail, falling through to the slower `soft_max_f32<true, 0, 0>` general path. Adding new specializations (e.g., `<512, 256>`) to handle this is possible but the softmax contribution to total runtime is negligible compared to MMQ.
+
+### `norm_f32_cuda` / `l2_norm_f32_cuda`
+
+Gemma 4 uses only RMS norm (`GGML_OP_RMS_NORM`). Layer norm (`GGML_OP_NORM`) and L2 norm (`GGML_OP_L2_NORM`) are not called during Gemma 4 inference.
+
+### `quantize_mmq_q8_1` (activation quantizer before MMQ)
+
+With `CUDA_QUANTIZE_BLOCK_SIZE_MMQ=128` and hidden_size=2304: 5 blocks/row × 512 rows = 2560 blocks. This kernel is trivially short (load 4 floats, warp-reduce, store). It is not a bottleneck; changing its block size has no measurable effect.
+
+### KV cache quantization
+
+`--ctk q8_0 --ctv q8_0` fails to initialize context for Gemma 4 (model-specific constraint). Other KV quant formats were not tested but are unlikely to help pp512 which is compute-bound, not memory-bound.
+
+### `small_k` MMVQ path
+
+For attention (head_dim=256): `blocks_per_row_x=8 < nwarps*blocks_per_iter_1warp=16` → `small_k=true`, `rows_per_block=nwarps=2`. Already enabled automatically; each attention MMVQ block processes 2 output rows. For the large weight matrices (hidden_size=2304): `blocks_per_row_x=72 ≥ 16` → `small_k=false`, `rows_per_block=1`. Correct behaviour in both cases.
+
+### Conclusion
+
+The remaining bottlenecks are intrinsic to the hardware:
+- **pp512**: MMQ is shmem-limited at 2 concurrent blocks/SM on Pascal's 48 KB SM. The tile geometry that achieves 2 blocks is already optimal; any reduction to get 3 blocks requires a tile size that causes more harm than the occupancy gain.
+- **tg128**: MMVQ is at the 32-block/SM block limit. Memory bandwidth (58.4 GB/s) is the ultimate constraint; more blocks cannot issue more memory requests than the bus can service.
+
