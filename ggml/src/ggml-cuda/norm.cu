@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "common.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -298,9 +299,17 @@ static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+    // On Pascal and other few-SM GPUs (nsm <= 4), using 512 threads/block instead of 1024
+    // allows more concurrent blocks per SM (4 vs 2), improving occupancy for prefill.
+    const int id  = ggml_cuda_get_device();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int block_size_large = (nsm <= 4 && ncols <= 8192) ? 512 : 1024;
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         rms_norm_f32<256, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else if (block_size_large == 512) {
+        const dim3 block_dims(512, 1, 1);
+        rms_norm_f32<512, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
         rms_norm_f32<1024, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
@@ -339,6 +348,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
     }
+    const int id  = ggml_cuda_get_device();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int block_size_large = (nsm <= 4 && ncols <= 8192) ? 512 : 1024;
     if (add == nullptr) {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
@@ -347,6 +359,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             rms_norm_f32<256, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        } else if (block_size_large == 512) {
+            const dim3 block_dims(512, 1, 1);
+            rms_norm_f32<512, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
         } else {
@@ -368,6 +385,13 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             rms_norm_f32<256, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        } else if (block_size_large == 512) {
+            const dim3 block_dims(512, 1, 1);
+            rms_norm_f32<512, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,

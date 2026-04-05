@@ -71,4 +71,23 @@ Device 0: NVIDIA Tegra X2, compute capability 6.2, VMM: no, VRAM: 7858 MiB
 **Delta vs Step 0**: pp512 +0.5%, tg128 +18.3%
 
 ## Step 4
+Use 512 threads/block instead of 1024 for RMS norm kernels on few-SM GPUs (nsm ≤ 4) when `1024 ≤ ncols ≤ 8192`.
+
+**Why**: The RMS norm kernel launches one block per token row. With 1024 threads/block on Pascal (2 SMs, 2048 threads/SM hard limit), only 2 blocks run concurrently (4 total). With 512 threads/block, 4 blocks/SM × 2 SMs = 8 concurrent blocks — doubling effective RMS norm throughput. The kernel iterates `col = tid; col < ncols; col += block_size`, so any power-of-2 block size is correct. Gemma 4 2B has hidden_size=2304, so each RMS norm processes 2304 elements per row, well within the 512-thread range. This improves pp512 (many RMS norm calls during prefill) without affecting tg128 significantly (decode has far fewer tokens per step).
+
+**Change**: `ggml/src/ggml-cuda/norm.cu`
+- Added `#include "common.cuh"` to access `ggml_cuda_get_device()` and `ggml_cuda_info()`
+- `rms_norm_f32_cuda`: added 512-thread branch for `1024 ≤ ncols ≤ 8192` when `nsm ≤ 4`
+- `rms_norm_mul_f32_cuda`: same 512-thread branch for both do_multiply and do_multiply+do_add variants
+
+```
+Device 0: NVIDIA Tegra X2, compute capability 6.2, VMM: no, VRAM: 7858 MiB
+| model                          |       size |     params | backend    | ngl | n_ubatch |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | --------------: | -------------------: |
+| gemma4 E2B Q4_0                |   2.82 GiB |     4.65 B | CUDA       |  99 |      256 |           pp512 |         77.70 ± 0.10 |
+| gemma4 E2B Q4_0                |   2.82 GiB |     4.65 B | CUDA       |  99 |      256 |           tg128 |          8.21 ± 0.01 |
+```
+
+**Delta vs Step 3**: pp512 +0.5%, tg128 flat
+**Delta vs Step 0**: pp512 +1.0%, tg128 +18.1%
 
