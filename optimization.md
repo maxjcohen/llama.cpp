@@ -46,4 +46,29 @@ Device 0: NVIDIA Tegra X2, compute capability 6.2, VMM: no, VRAM: 7858 MiB
 **Delta vs Step 0**: pp512 +0.7%, tg128 +3.4%
 
 ## Step 3
+Add `MMVQ_PARAMETERS_PASCAL` table in `ggml/src/ggml-cuda/mmvq.cu`: reduce nwarps from 4 to 2 for ncols_dst=1 (single-token decode) on Pascal architecture (sm_60–sm_69).
+
+**Why**: The MMVQ kernel (mul_mat_vec_q) is the decode hot-path. Each block computes 1 output row. With 4 warps per block (128 threads), Pascal's 2 SMs can run at most 16 blocks concurrently per SM = 32 blocks total. With 2 warps per block (64 threads), 32 blocks/SM × 2 SMs = 64 blocks run simultaneously — halving the number of serial execution waves for each matmul. The MMVQ computation is memory-bandwidth bound (loading Q4_0 weights), not compute-bound, so halving the warp count per block does not reduce throughput: both warp configurations saturate memory bandwidth at the same rate.
+
+The pp512 path (batch=256 with FORCE_MMQ) uses the MMQ kernel, not MMVQ, so it is unaffected by this change.
+
+**Change**: `ggml/src/ggml-cuda/mmvq.cu`
+- Added `MMVQ_PARAMETERS_PASCAL` to `mmvq_parameter_table_id` enum
+- `get_device_table_id()` (device): returns PASCAL for `__CUDA_ARCH__` 600–699
+- `get_device_table_id(cc)` (host): returns PASCAL for cc in `[PASCAL, VOLTA)`
+- `calc_nwarps`: PASCAL ncols_dst=1 → 2 warps (was 4)
+- `calc_rows_per_block`: PASCAL included in GENERIC/GCN group (rows_per_block=1)
+
+```
+Device 0: NVIDIA Tegra X2, compute capability 6.2, VMM: no, VRAM: 7858 MiB
+| model                          |       size |     params | backend    | ngl | n_ubatch |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | --------------: | -------------------: |
+| gemma4 E2B Q4_0                |   2.82 GiB |     4.65 B | CUDA       |  99 |      256 |           pp512 |         77.33 ± 0.07 |
+| gemma4 E2B Q4_0                |   2.82 GiB |     4.65 B | CUDA       |  99 |      256 |           tg128 |          8.22 ± 0.01 |
+```
+
+**Delta vs Step 2**: pp512 flat (within noise), tg128 +14.3%
+**Delta vs Step 0**: pp512 +0.5%, tg128 +18.3%
+
+## Step 4
 
