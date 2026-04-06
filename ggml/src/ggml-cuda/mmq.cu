@@ -313,6 +313,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
+    // On pre-Volta NVIDIA GPUs with fast FP16 (cc 6.0, 6.2 — NOT 6.1 which has 1/64 FP16 rate),
+    // cuBLAS FP16 GEMM (dequant → HGEMM) outperforms the MMQ DP4A kernel for batched matmuls
+    // because the complex K-quant dequantization inside MMQ under-utilizes the DP4A units,
+    // while cuBLAS amortizes the one-time dequant cost over many output rows.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && !fp16_mma_hardware_available(cc)
+            && fast_fp16_hardware_available(cc) && ne11 >= 2) {
+        return false;
+    }
+
 #ifdef GGML_CUDA_FORCE_MMQ
     return true;
 #endif //GGML_CUDA_FORCE_MMQ

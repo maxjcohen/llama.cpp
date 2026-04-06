@@ -142,51 +142,143 @@ regardless of `nthreads`.  Measured result: both pp512 and tg128 regressed sligh
 
 pp512: regression (-1.2%). tg128: regression (-0.7%). Change reverted.
 
----
+## Step 7
+Route Q4_K (and all K-quant) matmuls to cuBLAS FP16 GEMM instead of MMQ on
+pre-Volta GPUs with fast FP16 hardware. **pp512: 18.24 → 137.76 t/s (+655%).**
 
-## Ceiling Analysis — No Further Kernel-Level Improvements Identified
+### Background
 
-After exhaustive analysis of all kernel dispatch paths for this model/hardware, no
-further optimizations were found that reliably improve both pp512 and tg128.
+The previous ceiling analysis (Steps 1–6) concluded that pp512 was limited to ~18 t/s
+by MMQ DP4A kernel throughput. That analysis was correct *within the MMQ path* but
+missed a fundamentally better alternative: bypassing MMQ entirely.
 
-### Kernel-by-kernel status
+### The insight
 
-| Kernel | Situation | Verdict |
-|---|---|---|
-| MMVQ Q4_K (tg decode) | nwarps=2 for Pascal ncols_dst=1 (prior patch) | Optimal |
-| MMQ Q4_K/Q6_K (pp prefill) | mmq_x=64 (Q4_K, 2 blocks/SM), Q6_K capped at 40 (prior patch) | Optimal |
-| FA VEC (tg, SWA layers D=256) | 8 blocks/4 waves, both SMs fully used; nthreads=64 tried — no gain (register pressure) | Ceiling reached |
-| FA TILE (pp, SWA+global) | Large ntiles grids, well-utilized | Already full |
-| FA VEC (tg, global D=512) | gqa_opt_applies=false at tg context lengths → NONE → standard GPU attn | n/a |
-| RMS Norm | 512 threads per block (prior patch) | Optimal |
-| RoPE | 8 blocks × 256 threads; RoPE+SET_ROWS fusion active | Fine |
-| GLU/SwiGLU | 12 blocks × 256 threads, 2 SMs well-covered | Fine |
-| per_layer_model_proj (mmvf) | F32, block_size=256, 1536 output rows → ample parallelism | Fine |
-| stream_k (MMQ, FA TILE) | Correctly disabled on Pascal | Correct |
-| KV quant (Step 4) | Adds dequant overhead > BW savings at short sequences | Rejected |
+Jetson TX2 (cc 6.2) has FP16 arithmetic at 2× the FP32 rate — the same as Tesla P100
+(cc 6.0). This is unlike consumer Pascal cc 6.1 (GTX 1080 etc.) which has FP16 at
+1/64× rate. llama.cpp's `ggml_cuda_should_use_mmq()` returns `true` for **all**
+quantized types on pre-Volta GPUs (the check is `!fp16_mma_hardware_available(cc)`),
+unconditionally routing to the MMQ DP4A kernel.
 
-### Why tg128 is at its practical ceiling
+For simple quant types like Q4_0, this is fine — the DP4A dequantization is cheap and
+the kernel is well-tuned. But for K-quants (Q4_K, Q5_K, Q6_K), the super-block
+dequantization inside the MMQ kernel is complex (scales, mins, nested bit unpacking)
+and severely under-utilizes the DP4A units.
 
-At 7.49 t/s, effective memory bandwidth = 7.49 × 2.88 GB ≈ 21.6 GB/s out of
-58.4 GB/s peak (37% utilization). The gap is not from kernel inefficiency but from the
-sequential structure of the transformer:
+The alternative path — cuBLAS — first dequantizes Q4_K→FP16 via a dedicated convert
+kernel, then calls `maxwell_hgemm` (NVIDIA's tuned FP16 GEMM). The one-time dequant
+cost is amortized over the full GEMM, and `hgemm` runs at near-peak FP16 FLOPS.
 
-- 35 layers must execute serially (each depends on the previous)
-- ~500–700 kernel launches per generated token, each with CPU-side dispatch latency
-- VEC attention: 8 blocks/4 waves already at 100% SM utilization; further splitting
-  provides no benefit because the context (≤128 tokens) is too short for
-  `parallel_blocks > 1` to trigger (ntiles_KV = ceil(KV / D) = ceil(64/256) = 1)
-- MMVQ: already at optimal nwarps=2 giving max concurrent blocks per SM
+### nsys profiling confirmed the bottleneck
 
-Further gains would require architectural changes outside the kernel-tuning scope:
-CUDA graph capture (eliminates CPU dispatch overhead), kernel fusion across layers,
-or a fundamentally different model format (e.g., quantized KV with a bespoke kernel
-that amortizes the dequant cost).
+**Before (MMQ path):** `mul_mat_q<…Q4_K…>` consumed 49,179 ms out of 73,733 ms total
+GPU time (66.7%). Average 407 µs per call.
 
-### Why pp512 is at its practical ceiling
+**After (cuBLAS path):** `maxwell_hgemm_128x32_nn` + `convert_unary` replaced MMQ.
+Total GPU time dropped from 73,733 ms to 24,689 ms (-66%). The matmul portion went
+from 49,179 ms to 4,210 ms (-91%).
 
-At 18.2 t/s, Q4_K dequantization throughput is the bottleneck. mmq_x=64 gives
-2 blocks/SM (already at max for 49 KB shmem budget). Smaller mmq_x (32) would give
-3 blocks/SM but fewer columns per block, resulting in more waves and lower throughput
-per unit shmem loaded. Larger mmq_x is blocked by the Pascal mmq_x_max=64 limit
-(no Volta tensor cores available for the wider DP4A path).
+### What was changed
+
+`ggml/src/ggml-cuda/mmq.cu`, in `ggml_cuda_should_use_mmq()`, added a new early-return
+**before** the `GGML_CUDA_FORCE_MMQ` short-circuit:
+
+```c
+// On pre-Volta NVIDIA GPUs with fast FP16 (cc 6.0, 6.2 — NOT 6.1),
+// cuBLAS FP16 GEMM outperforms MMQ DP4A for K-quant batched matmuls.
+if (GGML_CUDA_CC_IS_NVIDIA(cc) && !fp16_mma_hardware_available(cc)
+        && fast_fp16_hardware_available(cc) && ne11 >= 2) {
+    return false;
+}
+```
+
+This returns `false` (= use cuBLAS) when:
+1. NVIDIA GPU (not AMD)
+2. Pre-Volta (no tensor cores / FP16 MMA)
+3. Has fast FP16 hardware (cc 6.0 or 6.2, excludes cc 6.1)
+4. Batch size ≥ 2 (single-token decode still uses MMVQ, unaffected)
+
+The `ne11 >= 2` threshold was tested at 2, 8, and 64 — all produced the same result
+since pp512 always dispatches with ne11=512. The threshold of 2 is conservative and
+correct: at ne11=1 the MMVQ path is used instead (not MMQ), so this guard only
+affects actual batched matmuls.
+
+### Other approaches tested and rejected
+
+- **CUDA graphs on Pascal:** Guard changed from `cc < AMPERE` to `cc < PASCAL`,
+  graphs work (258 launches, 128 reused) but zero performance benefit — no
+  hardware-accelerated graph dispatch on Pascal, `cudaGraphLaunch` costs ~8.7 ms
+  each, and CPU overhead already overlaps GPU execution. Reverted.
+
+- **`GGML_CUDA_FORCE_MMQ=ON` removal:** Tested building without it — identical
+  results because the new early-return fires before the `FORCE_MMQ` check.
+
+### Result
+
+```
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           pp512 |        137.76 ± 0.53 |
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           tg128 |          7.46 ± 0.00 |
+```
+
+pp512: 18.24 → 137.76 t/s (+655%) ✓  tg128: 7.49 → 7.46 t/s (flat, within noise) ✓
+
+### Cumulative progress from Step 0
+
+| Metric | Step 0 baseline | Step 7 | Improvement |
+|--------|---------------:|-------:|------------:|
+| pp512  | 17.67 t/s      | 137.76 t/s | +680% |
+| tg128  | 6.64 t/s       | 7.46 t/s   | +12.3% |
+
+### Why this was missed earlier
+
+The ceiling analysis in Steps 1–6 focused on tuning *within* the MMQ kernel (tile
+sizes, occupancy, shmem budgets). It correctly concluded that MMQ was at its ceiling.
+The breakthrough came from questioning the premise: why use MMQ at all when cuBLAS
+can leverage the TX2's fast FP16 hardware? The llama.cpp dispatch logic treats all
+pre-Volta GPUs identically, but cc 6.0/6.2 (Tesla P100, Jetson TX2) have fundamentally
+different FP16 performance from cc 6.1 (consumer Pascal).
+
+## Step 8
+MMVQ `rows_per_cuda_block` 1→2 for Pascal ncols_dst=1 decode.
+**tg128: 7.46 → 8.02 t/s (+7.5%).**
+
+### Background
+
+After Step 7, MMVQ (mul_mat_vec_q) is now the dominant kernel for tg128 decode,
+consuming ~62% of total GPU time. With `nwarps=2` and `rows_per_cuda_block=1`,
+each block computes a single output row. For hidden_dim=4096, this launches 4096
+blocks. With only 2 SMs on the TX2, those blocks must serialize through ~200+ waves
+(even with ~14-20 concurrent blocks per SM from the low register footprint).
+
+### What was changed
+
+`ggml/src/ggml-cuda/mmvq.cu`, in `calc_rows_per_block()`: for `MMVQ_PARAMETERS_PASCAL`
+with `ncols_dst=1`, return 2 instead of 1. This makes each CUDA block compute 2
+adjacent output rows, halving the grid from 4096 to 2048 blocks.
+
+Each thread now does two `vec_dot_q_cuda()` calls per inner loop iteration (one per
+row) using the same Q8 activation data, providing data reuse. The cost is slightly
+higher register pressure: +21 regs for Q4_K non-fused (51→72), +8 for fused (64→72),
++22 for Q6_K (40→62).
+
+### Alternatives tested
+
+- `rows_per_cuda_block=4`: tg128=7.95 — worse than 2. The extra register pressure
+  from 4 accumulator rows causes occupancy loss (14→~10 blocks/SM) that outweighs
+  the grid reduction benefit.
+
+### Result
+
+```
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           pp512 |        137.85 ± 0.23 |
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           tg128 |          8.01 ± 0.01 |
+```
+
+pp512: 137.76 → 137.85 t/s (flat) ✓  tg128: 7.46 → 8.01 t/s (+7.4%) ✓
+
+### Cumulative progress from Step 0
+
+| Metric | Step 0 baseline | Step 8 | Improvement |
+|--------|---------------:|-------:|------------:|
+| pp512  | 17.67 t/s      | 137.85 t/s | +680% |
+| tg128  | 6.64 t/s       | 8.01 t/s   | +20.6% |

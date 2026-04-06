@@ -397,7 +397,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_PASCAL) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                // On Pascal with few SMs, processing 2 rows per block halves the grid
+                // size, reducing scheduling overhead while keeping threads busy.
+                return (table_id == MMVQ_PARAMETERS_PASCAL) ? 2 : (small_k ? nwarps : 1);
             case 2:
             case 3:
             case 4:
