@@ -4166,7 +4166,15 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    const int    nsm    = ggml_cuda_info().devices[id].nsm;
+    const int mmq_x_max_base = get_mmq_x_max_host(cc);
+    // Q6_K on few-SM (<= 4) pre-Volta Pascal: cap mmq_x at 40 to reach 2 blocks/SM.
+    // At mmq_x=64 shmem=26.8 KB → floor(49152/26.8K)=1 block/SM (2 blocks total on 2-SM TX2).
+    // At mmq_x=40 shmem=23.7 KB → floor(49152/23.7K)=2 blocks/SM (4 blocks total) — 2× occupancy.
+    const int mmq_x_max = (type == GGML_TYPE_Q6_K &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA &&
+        !turing_mma_available(cc) && nsm <= 4)
+        ? std::min(mmq_x_max_base, 40) : mmq_x_max_base;
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;
