@@ -53,3 +53,30 @@ pp512: 18.05 → 18.23 t/s (+1.0%) ✓  tg128: 6.83 → 7.49 t/s (+9.7%) ✓
 All subsequent benchmarks use `-fa 1`.
 
 ## Step 3
+Optimal ubatch size for Q4_K_M is 512 (not 256 as for Q4_0).
+
+**Change:** Runtime flag only — use `-ub 512` instead of `-ub 256`.
+With ub=512 the entire pp512 prompt fits in a single batch pass.
+Q4_0 optimal was 256; Q4_K_M benefits from larger tiles because mmq_x was
+reduced to 40 for Q6_K layers (more kernel launches at smaller mmq_x amortize
+better with one big batch).
+
+Sweep results (all with `-fa 1`):
+- ub=64:   pp512=17.75,  tg128=7.27
+- ub=128:  pp512=18.42,  tg128=7.49
+- ub=256:  pp512=18.23,  tg128=7.49
+- **ub=512:  pp512=18.52±,  tg128=7.48** ← best
+- ub=1024: pp512=18.13,  tg128=7.44
+
+```
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           pp512 |         18.65 ± 0.05 |
+| gemma4 E2B Q4_K - Medium       |   2.88 GiB |     4.65 B | CUDA       |  99 |  1 |           tg128 |          7.49 ± 0.00 |
+
+build: 159b3a4f5 (8670)
+```
+
+pp512: 18.23 → 18.52 t/s (+1.6%) ✓  tg128: 7.49 → 7.49 t/s (flat) ✓
+
+All subsequent benchmarks use `-fa 1 -ub 512`.
+
+## Step 4
