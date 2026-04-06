@@ -80,3 +80,12 @@ pp512: 18.23 → 18.52 t/s (+1.6%) ✓  tg128: 7.49 → 7.49 t/s (flat) ✓
 All subsequent benchmarks use `-fa 1 -ub 512`.
 
 ## Step 4
+KV cache quantization — tested, no improvement.
+
+- `--cache-type-k q8_0 --cache-type-v q8_0`: pp512=18.61 (+0.5%), tg128=7.33 (-2.1%) ✗
+- `--cache-type-k q4_0 --cache-type-v q4_0`: pp512=18.35 (-0.9%), tg128=7.26 (-3.1%) ✗
+
+Dequantization overhead in the FA kernel exceeds bandwidth savings at tg128 sequence
+lengths (only 128 KV vectors). Standard f16 KV cache remains best.
+
+## Step 5
