@@ -298,11 +298,11 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_PASCAL) {
-        // On Pascal (sm_60-sm_69) with few SMs, using 2 warps/block for ncols_dst=1
-        // doubles the number of concurrent blocks per SM, reducing serialization.
+        // On Pascal (sm_60-sm_69) with few SMs, using 1 warp/block for ncols_dst=1
+        // maximizes concurrent blocks per SM.
         switch (ncols_dst) {
             case 1:
-                return 2;
+                return 1;
             case 2:
             case 3:
             case 4:
